@@ -1,7 +1,17 @@
 # =============================================================================
-# 文件名: immortalwrt-sdk-build.yml  (V3 修正版)
+# 文件名: immortalwrt-sdk-build.yml  (V4 修正版)
 # 用途  : 基于【ImmortalWrt 官方 SDK】在 GitHub Actions 上编译单个 LuCI 插件
 #         示例插件: luci-app-dockerman (Docker 管理界面)
+#
+# V4 修正内容（相对 V3）:
+#   ✔ 产物过多: 关闭 SDK 默认"全选"开关(CONFIG_ALL / CONFIG_ALL_KMODS /
+#     CONFIG_ALL_NONSHARED), 否则 defconfig 会把所有包设为选中, 编译依赖链时
+#     连带产出上百个依赖包(官方文档明确提示要关掉这三项)
+#   ✔ 产物过滤: 新增 COLLECT_ALL 开关(false 时只收插件本身及其显式依赖,
+#     true 时收全部 —— 取决于你是否要连同依赖一起分发)
+#   ✔ Release 为空: 增加 publish_release 开关 + permissions: contents: write,
+#     真正执行 softprops/action-gh-release; 之前该步骤被注释, 只有 artifact
+#     (artifact 在 run 页面, 不是仓库 Releases 页, 两者不是一回事)
 #
 # V3 修正内容（相对 v2）:
 #   ✔ 修复 cp 自复制报错(退出码 1): 插件源码改用 actions/checkout 的
@@ -48,6 +58,16 @@ on:
         description: "子平台"
         required: true
         default: "64"
+      # 【可变】是否创建 GitHub Release(仓库 Releases 页的正式发布)
+      # 【注意】false 时只上传 artifact(在 Actions run 页面, 默认保留 90 天)
+      publish_release:
+        description: "是否创建 GitHub Release(true/false)"
+        required: true
+        default: "false"
+
+# 【不可变·V4 新增】Release 需要写权限; 只上传 artifact 时可改为 contents: read
+permissions:
+  contents: write
 
 concurrency:
   group: immortalwrt-sdk-${{ github.ref }}
@@ -68,6 +88,10 @@ jobs:
       EXTRA_PKGS: "lisaac/luci-lib-docker:master"
       # feeds 里能解析到的依赖包名
       FEED_DEPS: "luci-lib-jsonc"
+      # 【可变·V4 新增】产物收集范围:
+      #   false = 只收插件本身 + EXTRA_PKGS + FEED_DEPS 对应的包(推荐, 体积小)
+      #   true  = 收 bin/packages 下全部产物(依赖链上的所有包, 可能上百个)
+      COLLECT_ALL: "false"
 
     steps:
       # -------------------------------------------------------------------------
@@ -216,13 +240,32 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
+      # -------------------------------------------------------------------------
+      # ⑦ 生成 .config 并选中要编译的包
+      # 【V4 关键修复】必须先关掉 SDK 的三个"全选"开关, 否则产物爆炸:
+      #   CONFIG_ALL             = 默认选中"全部用户态软件包"
+      #   CONFIG_ALL_KMODS       = 默认选中"全部内核模块包"
+      #   CONFIG_ALL_NONSHARED   = 默认选中"全部 target 专属包"
+      #   官方文档《Using the SDK》原文提示: "You probably want to disable some
+      #   default settings, which build every available package." —— 就是在说
+      #   这三项。开着它们: 目标包依赖链一旦碰到内核/基础库, 会把成百上千个包
+      #   一并选中并编译, 于是 bin/packages 下出现几十~上百个 .apk。
+      # 【不可变】必须在 make defconfig 之前写入, defconfig 只补默认值, 不会推翻
+      #           已显式写入的 =n。
+      # 【不可变】CONFIG_PACKAGE_<包名>=y 命名规则 (y=编译进系统, m=可编成包)
+      # -------------------------------------------------------------------------
       - name: Configure packages
         working-directory: sdk
         run: |
+          echo "CONFIG_ALL=n"             >> .config
+          echo "CONFIG_ALL_KMODS=n"       >> .config
+          echo "CONFIG_ALL_NONSHARED=n"   >> .config
           echo "CONFIG_PACKAGE_${PLUGIN_NAME}=y" >> .config
           for d in ${FEED_DEPS}; do echo "CONFIG_PACKAGE_${d}=y" >> .config; done
           make defconfig
+          # 确认: 目标包被选中, 且"全选"开关确实是 n
           grep -E "CONFIG_PACKAGE_${PLUGIN_NAME}=y" .config
+          grep -E "^CONFIG_ALL(=|_KMODS=|_NONSHARED=)" .config || echo "!! 警告: 未找到 CONFIG_ALL* 开关"
 
       - name: Compile plugin (and dependencies)
         working-directory: sdk
@@ -230,17 +273,49 @@ jobs:
           make -j"$(nproc)" package/${PLUGIN_NAME}/compile V=s
 
       # -------------------------------------------------------------------------
-      # 产物收集
-      # 【注意】ImmortalWrt 25.12 起产物为 .apk；24.10 及更早为 .ipk。
-      #   两个 glob 通吃新旧版本。
+      # ⑧ 收集产物 (V4: 默认只收"插件 + 显式依赖", 不再无脑收全部)
+      # 【注意】为什么之前会有一大堆包: make package/<名>/compile 会连带编译
+      #   依赖链上的每个包, 每个包都产出一个安装文件; 再叠加 SDK 默认的
+      #   CONFIG_ALL* 全选开关, 就会把整个软件集合都编出来。
+      # 【可变】COLLECT_ALL=true 时才保留全部产物(适合离线装机的完整依赖集)
+      # 【不可变】25.12 起为 .apk; 24.10 及更早为 .ipk —— 两种后缀都匹配:
+      #   apk 命名 <名>-<版本>.apk; ipk 命名 <名>_<版本>_<架构>.ipk
       # -------------------------------------------------------------------------
       - name: Collect artifacts
         run: |
           mkdir -p out
-          find sdk/bin/packages sdk/bin/targets \
-               -type f \( -name "*.apk" -o -name "*.ipk" \) \
-               ! -name "*debug*" -exec cp {} out/ \;
+          names="${PLUGIN_NAME}"
+          for p in ${EXTRA_PKGS}; do names="${names} $(basename "${p%%:*}")"; done
+          names="${names} ${FEED_DEPS}"
+          echo "本次目标包: ${names}"
+
+          if [ "${COLLECT_ALL}" = "true" ]; then
+            echo "== COLLECT_ALL=true, 收集全部产物 =="
+            find sdk/bin/packages sdk/bin/targets -type f \
+                 \( -name "*.apk" -o -name "*.ipk" \) ! -name "*debug*" \
+                 -exec cp {} out/ \;
+          else
+            # 只按包名前缀精确匹配(注意: 不能误收 luci-app-dockerman 之外的同前缀包)
+            for n in ${names}; do
+              find sdk/bin/packages sdk/bin/targets -type f \
+                   \( -name "${n}-*.apk" -o -name "${n}-*.ipk" -o -name "${n}_*.ipk" \) \
+                   ! -name "*debug*" -exec cp {} out/ \;
+            done
+          fi
+
+          echo "== 产物统计 =="
           ls -lh out
+          echo "文件数: $(ls out | wc -l)"
+          # 写入 Actions 运行摘要, 不用下载也能看清产出了什么
+          {
+            echo "### ${PLUGIN_NAME} 编译产物"
+            echo ""
+            echo "共 $(ls out | wc -l) 个文件 (COLLECT_ALL=${COLLECT_ALL})"
+            echo ""
+            echo '```'
+            ls out
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
           [ -n "$(ls out 2>/dev/null)" ] || { echo "!! 没有编译产物"; exit 1; }
 
       - name: Upload packages
@@ -249,3 +324,27 @@ jobs:
           name: immortalwrt-${{ inputs.immortalwrt_version }}-${{ inputs.target }}-${{ inputs.subtarget }}-${{ env.PLUGIN_NAME }}
           path: out/*
           if-no-files-found: error
+
+      # -------------------------------------------------------------------------
+      # ⑨ 发布 Release (V4 新增/启用)
+      # 【注意·为什么之前 Releases 页是空的】旧版这一步是注释掉的, 全程只做了
+      #   upload-artifact —— artifact 出现在 run 页面底部, 90 天后自动清理,
+      #   从来不会出现在仓库的 Releases 页; 两者是不同机制。
+      # 【不可变】需要顶部 permissions: contents: write, 否则 403。
+      # 【不可变】tag_name 必须全局唯一; 重复用同一 tag 会报 "already_exists"。
+      # 【可变】tag 命名规则、是否 draft/prerelease 自行决定。
+      # -------------------------------------------------------------------------
+      - name: Publish release
+        if: ${{ inputs.publish_release == 'true' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.PLUGIN_NAME }}-${{ inputs.immortalwrt_version }}-${{ inputs.target }}-${{ inputs.subtarget }}
+          name: ${{ env.PLUGIN_NAME }} for ImmortalWrt ${{ inputs.immortalwrt_version }} (${{ inputs.target }}/${{ inputs.subtarget }})
+          body: |
+            自动构建产物
+            - 发行版: ImmortalWrt ${{ inputs.immortalwrt_version }}
+            - 平台: ${{ inputs.target }}/${{ inputs.subtarget }}
+            - 插件: ${{ env.PLUGIN_NAME }}
+            - 产物格式: ImmortalWrt 25.12+ 为 .apk；24.10 及更早为 .ipk
+          files: out/*
+          fail_on_unmatched_files: true
