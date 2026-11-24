@@ -1,16 +1,25 @@
 # =============================================================================
-# 文件名: immortalwrt-sdk-build.yml
-# 用途  : 基于【ImmortalWrt 官方 SDK】在 GitHub Actions 上编译同一个 LuCI 插件
+# 文件名: immortalwrt-sdk-build.yml  (v2 修正版)
+# 用途  : 基于【ImmortalWrt 官方 SDK】在 GitHub Actions 上编译单个 LuCI 插件
 #         示例插件: luci-app-dockerman (Docker 管理界面)
 #
-# 与 openwrt-sdk-build.yml 的结构完全同构，差异点全部用 ⚠ 标出，共 5 处：
+# v2 修正内容（相对 v1）:
+#   ✔ sha256sums 校验文件获取失败 → 自动回退官方源
+#     (实测: sha256sums 只存在于 targets/<t>/<s>/ 这一级目录, releases 根目录
+#      没有; 镜像可能缺失, 例如 mirrors.sdu.edu.cn 实测出现过 504 超时)
+#   ✔ sha256sums 是全目录树校验合集(25.12.2/x86/64 实测 1344 行, 含 img.gz/
+#     qcow2/vdi/vhdx/vmdk/iso/toolchain/kmods/packages 等各种条目, 且带 kmods/、
+#     packages/ 相对路径) → 只精确提取 SDK 一行做校验, 不再对整文件执行
+#     sha256sum -c (否则带路径条目全部报 "FAILED open or read")
+#   ✔ 修复缓存 bug: 下载落盘目录改为 sdk-archive/, 与 actions/cache 的 path
+#     声明保持一致; 缓存恢复步骤移到下载步骤之前(v1 中缓存声明了却拿不到东西)
+#
+# 与 OpenWrt 版的结构完全同构，差异点用 ⚠ 标出:
 #   ⚠1 下载域名与文件名前缀 (immortalwrt-*)
 #   ⚠2 版本号独立 (25.12.2 ≠ OpenWrt 25.12.6，修订号不跟随上游)
 #   ⚠3 feeds 源指向 ImmortalWrt 自己的 fork (packages/luci 内容不同)
-#   ⚠4 可选国内镜像加速 (官方在国内维护了多个镜像)
+#   ⚠4 可选国内镜像加速
 #   ⚠5 产物兼容性: 只能刷 ImmortalWrt 固件，与 OpenWrt 包不可互装
-#
-# 图例: 【可变】/【不可变】/【注意】含义同 OpenWrt 版注释
 # =============================================================================
 
 name: Build luci-app-dockerman (ImmortalWrt SDK)
@@ -43,12 +52,14 @@ jobs:
     timeout-minutes: 120
 
     env:
-      # ⚠【不可变约定】make 目标名与包名必须与插件 Makefile 里的
+      # 【不可变约定】make 目标名与包名必须与插件 Makefile 里的
       #   Package/<name> 一致，OpenWrt 与 ImmortalWrt 完全相同。
       PLUGIN_NAME: luci-app-dockerman
       PLUGIN_REPO: lisaac/luci-app-dockerman
       PLUGIN_BRANCH: master
+      # 编译期还需要但不在任何 feed 里的依赖包(空格分隔, "owner/repo:branch" 格式)
       EXTRA_PKGS: "lisaac/luci-lib-docker:master"
+      # feeds 里能解析到的依赖包名
       FEED_DEPS: "luci-lib-jsonc"
 
     steps:
@@ -65,41 +76,87 @@ jobs:
             zlib1g-dev libncurses-dev libc6-dev
 
       # -------------------------------------------------------------------------
-      # ⚠1 + ⚠4 SDK 下载
-      # 域名: downloads.immortalwrt.org (OpenWrt 是 downloads.openwrt.org)
-      # 文件前缀: immortalwrt-sdk-*        (OpenWrt 是 openwrt-sdk-*)
-      # 国内镜像【可变】三选一:
-      #   https://mirrors.sdu.edu.cn/immortalwrt/releases     (山东大学)
-      #   https://mirrors.ustc.edu.cn/immortalwrt/releases    (中科大)
-      #   https://mirrors.vsean.net/openwrt                   (社区源)
-      # 同样从 sha256sums 动态解析文件名 —— ⚠ ImmortalWrt 的 SDK 文件名同样
-      # 内嵌 gcc 版本 (25.12.2 为 gcc-14.3.0_musl)，不可硬编码。
+      # SDK 包缓存 —— 【不可变】必须放在"下载"步骤之前，恢复缓存才有意义;
+      # path 必须与下载步骤的实际落盘目录 sdk-archive/ 一致(此为 v1 的 bug 修复)
+      # 【可变】key 含版本/平台，版本变更自动失效
       # -------------------------------------------------------------------------
-      - name: Resolve & download ImmortalWrt SDK
-        run: |
-          VER="${{ inputs.immortalwrt_version }}"
-          TGT="${{ inputs.target }}"; SUB="${{ inputs.subtarget }}"
-          BASE="https://downloads.immortalwrt.org/releases/${VER}/targets/${TGT}/${SUB}"
-          SDK_FILE=$(curl -fsSL "${BASE}/sha256sums" \
-                     | grep -oE 'immortalwrt-sdk-[^\ ]+\.tar\.(zst|xz)' | head -n1)
-          [ -n "${SDK_FILE}" ] || { echo "!! 未找到 SDK 文件名"; exit 1; }
-          echo "SDK_FILE=${SDK_FILE}" >> "$GITHUB_ENV"
-          curl -fSL --retry 3 -o "${SDK_FILE}" "${BASE}/${SDK_FILE}"
-          grep -F "${SDK_FILE}" "${BASE}/sha256sums" | sed 's/ \+/  /' | sha256sum -c -
-
-      - name: Cache SDK tarball
+      - name: Restore SDK cache
         uses: actions/cache@v4
         with:
           path: sdk-archive
           key: immortalwrt-sdk-${{ inputs.immortalwrt_version }}-${{ inputs.target }}-${{ inputs.subtarget }}
 
+      # -------------------------------------------------------------------------
+      # ⚠1 解析文件名 → 下载 → 单行校验
+      #
+      # 域名: downloads.immortalwrt.org (OpenWrt 是 downloads.openwrt.org)
+      # 文件前缀: immortalwrt-sdk-*        (OpenWrt 是 openwrt-sdk-*)
+      #
+      # 【不可变·事实】sha256sums 只在 targets/<target>/<subtarget>/ 这一级提供
+      # 【注意·事实】部分镜像同步不全: 实测 mirrors.sdu.edu.cn 的该文件返回 504。
+      #              所以 "所选源 → 官方源" 两级回退，官方源永远拿得到。
+      # 【注意·事实】sha256sums 不是"只有 SDK 一行"，而是整个目标目录树的校验
+      #              合集(25.12.2/x86/64 为 1344 行): .img.gz/.qcow2/.vdi/.vhdx/
+      #              .vmdk/.iso 各种镜像格式 + kernel + toolchain + imagebuilder
+      #              + 带 kmods/、packages/ 相对路径的条目。
+      #              → 必须用 SDK 前缀精确过滤出那一行，只对单行执行校验。
+      # 【不可变】SDK 文件名内嵌 gcc 版本(25.12.2 为 gcc-14.3.0_musl)，随发布
+      #           变化，必须动态解析，不可硬编码。
+      # 【可变】MIRROR 置空 = 官方源；国内构建可改:
+      #   https://mirrors.ustc.edu.cn/immortalwrt/releases   (中科大, 实测可用)
+      #   https://mirrors.vsean.net/openwrt                  (社区源, 实测可用)
+      #   https://mirrors.sdu.edu.cn/immortalwrt/releases    (山大, 校验文件曾 504)
+      # -------------------------------------------------------------------------
+      - name: Resolve & download ImmortalWrt SDK
+        run: |
+          VER="${{ inputs.immortalwrt_version }}"
+          TGT="${{ inputs.target }}"; SUB="${{ inputs.subtarget }}"
+          MIRROR=""    # 【可变】镜像加速开关
+          OFFICIAL="https://downloads.immortalwrt.org/releases/${VER}/targets/${TGT}/${SUB}"
+          BASE="${MIRROR:-${OFFICIAL}}"
+
+          # ---- ⓪ 缓存命中则跳过下载 (目录与缓存 path 对应) ----
+          if [ -d sdk-archive ] && [ -n "$(ls sdk-archive 2>/dev/null)" ]; then
+            SDK_FILE=$(ls sdk-archive | head -n1)
+            echo "SDK_FILE=${SDK_FILE}" >> "$GITHUB_ENV"
+            echo "== 缓存命中, 跳过下载: ${SDK_FILE} =="
+            exit 0
+          fi
+
+          # ---- ① 取校验文件: 所选源失败自动回退官方源 ----
+          mkdir -p sdk-archive
+          curl -fsSL --max-time 30 "${BASE}/sha256sums" -o sha256sums \
+            || { echo "!! 所选源无 sha256sums, 回退官方源"; \
+                 curl -fsSL --max-time 30 "${OFFICIAL}/sha256sums" -o sha256sums; }
+          [ -s sha256sums ] || { echo "!! sha256sums 两级获取均失败, 请更换镜像"; exit 1; }
+
+          # ---- ② 精确提取 SDK 行 (该文件含上千条其他格式条目, 只取这一行) ----
+          SDK_LINE=$(grep -E '\*?immortalwrt-sdk-[^[:space:]]+\.tar\.(zst|xz)$' sha256sums)
+          [ -n "${SDK_LINE}" ] || { echo "!! sha256sums 中无 SDK 条目, 版本号写错了?"; exit 1; }
+          SDK_FILE=$(grep -oE 'immortalwrt-sdk-[^[:space:]]+\.tar\.(zst|xz)' <<<"${SDK_LINE}")
+          echo "SDK_FILE=${SDK_FILE}" >> "$GITHUB_ENV"
+          echo "== 解析到 SDK: ${SDK_FILE} =="
+
+          # ---- ③ 下载: 所选源失败自动回退官方源 ----
+          curl -fSL --retry 3 -o "sdk-archive/${SDK_FILE}" "${BASE}/${SDK_FILE}" \
+            || { echo "!! 所选源下载失败, 回退官方源"; \
+                 curl -fSL --retry 3 -o "sdk-archive/${SDK_FILE}" "${OFFICIAL}/${SDK_FILE}"; }
+
+          # ---- ④ 单行校验 (绝对不要对整个 sha256sums 执行 -c) ----
+          ( cd sdk-archive && printf '%s\n' "${SDK_LINE}" | sha256sum -c - )
+
+      # -------------------------------------------------------------------------
+      # 解压
+      # 【不可变】tar --strip-components=1 去掉包内第一层目录(目录名含 gcc 版本，
+      #           不固定)，统一解到 ./sdk；新版 .tar.zst 用 --zstd，旧版 -J (xz)
+      # -------------------------------------------------------------------------
       - name: Extract SDK
         run: |
           case "${SDK_FILE}" in
             *.tar.zst) TAROPT="--zstd" ;;
             *.tar.xz)  TAROPT="-J" ;;
           esac
-          mkdir -p sdk && tar ${TAROPT} -xf "${SDK_FILE}" -C sdk --strip-components=1
+          mkdir -p sdk && tar ${TAROPT} -xf "sdk-archive/${SDK_FILE}" -C sdk --strip-components=1
           ls sdk
 
       - name: Copy plugin & extra deps into SDK
@@ -114,8 +171,7 @@ jobs:
           done
 
       # -------------------------------------------------------------------------
-      # ⚠3 刷新 feeds
-      # 【不可变】命令与 OpenWrt 一模一样，但行为不同:
+      # ⚠3 刷新 feeds —— 命令与 OpenWrt 一模一样，但行为不同:
       #   ImmortalWrt SDK 内的 feeds.conf.default 指向它自己的 fork 仓库
       #   (immortalwrt/packages 等)，里面多出大量国内常用插件与补丁版本，
       #   与官方 openwrt/packages、openwrt/luci 的内容并不一致。
@@ -143,8 +199,8 @@ jobs:
           make -j"$(nproc)" package/${PLUGIN_NAME}/compile V=s
 
       # -------------------------------------------------------------------------
-      # 产物收集与 OpenWrt 版一致:
-      # 【注意】ImmortalWrt 25.12 起同为 .apk；24.10 及更早为 .ipk。
+      # 产物收集
+      # 【注意】ImmortalWrt 25.12 起产物为 .apk；24.10 及更早为 .ipk。
       #   两个 glob 通吃新旧版本。
       # -------------------------------------------------------------------------
       - name: Collect artifacts
