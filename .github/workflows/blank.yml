@@ -1,36 +1,164 @@
-# This is a basic workflow to help you get started with Actions
+# =============================================================================
+# 文件名: immortalwrt-sdk-build.yml
+# 用途  : 基于【ImmortalWrt 官方 SDK】在 GitHub Actions 上编译同一个 LuCI 插件
+#         示例插件: luci-app-dockerman (Docker 管理界面)
+#
+# 与 openwrt-sdk-build.yml 的结构完全同构，差异点全部用 ⚠ 标出，共 5 处：
+#   ⚠1 下载域名与文件名前缀 (immortalwrt-*)
+#   ⚠2 版本号独立 (25.12.2 ≠ OpenWrt 25.12.6，修订号不跟随上游)
+#   ⚠3 feeds 源指向 ImmortalWrt 自己的 fork (packages/luci 内容不同)
+#   ⚠4 可选国内镜像加速 (官方在国内维护了多个镜像)
+#   ⚠5 产物兼容性: 只能刷 ImmortalWrt 固件，与 OpenWrt 包不可互装
+#
+# 图例: 【可变】/【不可变】/【注意】含义同 OpenWrt 版注释
+# =============================================================================
 
-name: CI
+name: Build luci-app-dockerman (ImmortalWrt SDK)
 
-# Controls when the workflow will run
 on:
-  # Triggers the workflow on push or pull request events but only for the "main" branch
-  push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
-
-  # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
+    inputs:
+      # ⚠2【可变】ImmortalWrt 的修订号独立发布、可跳号(如无 23.05.5)，
+      #    以 https://downloads.immortalwrt.org/releases/ 实际列表为准。
+      immortalwrt_version:
+        description: "ImmortalWrt 版本号(独立修订号, 不跟随 OpenWrt)"
+        required: true
+        default: "25.12.2"
+      target:
+        description: "目标平台"
+        required: true
+        default: "x86"
+      subtarget:
+        description: "子平台"
+        required: true
+        default: "64"
 
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+concurrency:
+  group: immortalwrt-sdk-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  # This workflow contains a single job called "build"
   build:
-    # The type of runner that the job will run on
     runs-on: ubuntu-latest
+    timeout-minutes: 120
 
-    # Steps represent a sequence of tasks that will be executed as part of the job
+    env:
+      # ⚠【不可变约定】make 目标名与包名必须与插件 Makefile 里的
+      #   Package/<name> 一致，OpenWrt 与 ImmortalWrt 完全相同。
+      PLUGIN_NAME: luci-app-dockerman
+      PLUGIN_REPO: lisaac/luci-app-dockerman
+      PLUGIN_BRANCH: master
+      EXTRA_PKGS: "lisaac/luci-lib-docker:master"
+      FEED_DEPS: "luci-lib-jsonc"
+
     steps:
-      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
-      - uses: actions/checkout@v4
+      - name: Checkout plugin source
+        uses: actions/checkout@v4
 
-      # Runs a single command using the runners shell
-      - name: Run a one-line script
-        run: echo Hello, world!
-
-      # Runs a set of commands using the runners shell
-      - name: Run a multi-line script
+      - name: Install build dependencies
         run: |
-          echo Add other actions to build,
-          echo test, and deploy your project.
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang flex bison g++ gawk gcc make git \
+            curl wget tar unzip xz-utils zstd file rsync \
+            python3 python3-dev python3-pip python3-setuptools \
+            zlib1g-dev libncurses-dev libc6-dev
+
+      # -------------------------------------------------------------------------
+      # ⚠1 + ⚠4 SDK 下载
+      # 域名: downloads.immortalwrt.org (OpenWrt 是 downloads.openwrt.org)
+      # 文件前缀: immortalwrt-sdk-*        (OpenWrt 是 openwrt-sdk-*)
+      # 国内镜像【可变】三选一:
+      #   https://mirrors.sdu.edu.cn/immortalwrt/releases     (山东大学)
+      #   https://mirrors.ustc.edu.cn/immortalwrt/releases    (中科大)
+      #   https://mirrors.vsean.net/openwrt                   (社区源)
+      # 同样从 sha256sums 动态解析文件名 —— ⚠ ImmortalWrt 的 SDK 文件名同样
+      # 内嵌 gcc 版本 (25.12.2 为 gcc-14.3.0_musl)，不可硬编码。
+      # -------------------------------------------------------------------------
+      - name: Resolve & download ImmortalWrt SDK
+        run: |
+          VER="${{ inputs.immortalwrt_version }}"
+          TGT="${{ inputs.target }}"; SUB="${{ inputs.subtarget }}"
+          BASE="https://downloads.immortalwrt.org/releases/${VER}/targets/${TGT}/${SUB}"
+          SDK_FILE=$(curl -fsSL "${BASE}/sha256sums" \
+                     | grep -oE 'immortalwrt-sdk-[^\ ]+\.tar\.(zst|xz)' | head -n1)
+          [ -n "${SDK_FILE}" ] || { echo "!! 未找到 SDK 文件名"; exit 1; }
+          echo "SDK_FILE=${SDK_FILE}" >> "$GITHUB_ENV"
+          curl -fSL --retry 3 -o "${SDK_FILE}" "${BASE}/${SDK_FILE}"
+          grep -F "${SDK_FILE}" "${BASE}/sha256sums" | sed 's/ \+/  /' | sha256sum -c -
+
+      - name: Cache SDK tarball
+        uses: actions/cache@v4
+        with:
+          path: sdk-archive
+          key: immortalwrt-sdk-${{ inputs.immortalwrt_version }}-${{ inputs.target }}-${{ inputs.subtarget }}
+
+      - name: Extract SDK
+        run: |
+          case "${SDK_FILE}" in
+            *.tar.zst) TAROPT="--zstd" ;;
+            *.tar.xz)  TAROPT="-J" ;;
+          esac
+          mkdir -p sdk && tar ${TAROPT} -xf "${SDK_FILE}" -C sdk --strip-components=1
+          ls sdk
+
+      - name: Copy plugin & extra deps into SDK
+        run: |
+          mkdir -p "sdk/package/${PLUGIN_NAME}"
+          cp -a "${GITHUB_WORKSPACE}/." "sdk/package/${PLUGIN_NAME}/"
+          for pkg in ${EXTRA_PKGS}; do
+            repo="${pkg%%:*}"; branch="${pkg##*:}"
+            name=$(basename "${repo}")
+            git clone --depth 1 -b "${branch}" "https://github.com/${repo}.git" "/tmp/${name}"
+            cp -a "/tmp/${name}" "sdk/package/${name}"
+          done
+
+      # -------------------------------------------------------------------------
+      # ⚠3 刷新 feeds
+      # 【不可变】命令与 OpenWrt 一模一样，但行为不同:
+      #   ImmortalWrt SDK 内的 feeds.conf.default 指向它自己的 fork 仓库
+      #   (immortalwrt/packages 等)，里面多出大量国内常用插件与补丁版本，
+      #   与官方 openwrt/packages、openwrt/luci 的内容并不一致。
+      # 【注意】因此"同一个插件"在两家 SDK 下解析出的依赖(如 luci-lib-jsonc、
+      #   ucode 版本)可能不同，产物 ABI 以各自固件为准，不可互装 (⚠5)。
+      # -------------------------------------------------------------------------
+      - name: Update & install feeds
+        working-directory: sdk
+        run: |
+          cat feeds.conf.default   # 打印实际 feed 列表，便于核对与排查
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Configure packages
+        working-directory: sdk
+        run: |
+          echo "CONFIG_PACKAGE_${PLUGIN_NAME}=y" >> .config
+          for d in ${FEED_DEPS}; do echo "CONFIG_PACKAGE_${d}=y" >> .config; done
+          make defconfig
+          grep -E "CONFIG_PACKAGE_${PLUGIN_NAME}=y" .config
+
+      - name: Compile plugin (and dependencies)
+        working-directory: sdk
+        run: |
+          make -j"$(nproc)" package/${PLUGIN_NAME}/compile V=s
+
+      # -------------------------------------------------------------------------
+      # 产物收集与 OpenWrt 版一致:
+      # 【注意】ImmortalWrt 25.12 起同为 .apk；24.10 及更早为 .ipk。
+      #   两个 glob 通吃新旧版本。
+      # -------------------------------------------------------------------------
+      - name: Collect artifacts
+        run: |
+          mkdir -p out
+          find sdk/bin/packages sdk/bin/targets \
+               -type f \( -name "*.apk" -o -name "*.ipk" \) \
+               ! -name "*debug*" -exec cp {} out/ \;
+          ls -lh out
+          [ -n "$(ls out 2>/dev/null)" ] || { echo "!! 没有编译产物"; exit 1; }
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: immortalwrt-${{ inputs.immortalwrt_version }}-${{ inputs.target }}-${{ inputs.subtarget }}-${{ env.PLUGIN_NAME }}
+          path: out/*
+          if-no-files-found: error
