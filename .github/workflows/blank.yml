@@ -103,10 +103,12 @@ jobs:
       PLUGIN_NAME: luci-app-dockerman
       PLUGIN_REPO: lisaac/luci-app-dockerman
       PLUGIN_BRANCH: master
-      # 【可变·V5.1 新增】插件 Makefile 在仓库内的相对路径(相对仓库根):
-      #   lisaac 仓库按 LuCI feed 布局放在 applications/ 下, 必须指明;
-      #   若插件 Makefile 直接在仓库根目录, 置空 ""
-      PLUGIN_SUBDIR: "applications/luci-app-dockerman"
+      # 【可变·V5.1 新增】插件 Makefile 在仓库内的相对路径:
+      #   "auto" = 自动探测(推荐): 在 checkout 内容里(最多3层)找 Makefile,
+      #            优先取最浅层的, 兼容"根目录就是插件"和"applications/ 嵌套"两种布局
+      #   具体路径如 "applications/luci-app-dockerman" = 强制指定子目录
+      #   "" = 强制使用仓库根目录
+      PLUGIN_SUBDIR: "auto"
       # 编译期还需要但不在任何 feed 里的依赖包(空格分隔, "owner/repo:branch" 格式)
       EXTRA_PKGS: "lisaac/luci-lib-docker:master"
       # feeds 里能解析到的依赖包名
@@ -126,22 +128,29 @@ jobs:
     steps:
       # -------------------------------------------------------------------------
       # ① 获取插件源码
-      # 【不可变】actions/checkout@v4 + with.path 把源码检出到独立子目录 plugin/
-      # 【注意·V3 修复】为什么必须用独立子目录:
-      #   之前写法是 cp -a "${GITHUB_WORKSPACE}/." → 会把工作区"全部内容"(包括
+      # 【V5.3】不再用 actions/checkout 获取插件源码, 改为按 PLUGIN_REPO/BRANCH
+      #   主动克隆 —— 这样 workflow 可以放在任意仓库(包括只放 yml 的仓库),
+      #   插件源码始终来自指定的上游仓库。
+      # 【注意·V3 修复仍有效】源码必须放独立子目录 plugin/:
+      #   旧写法 cp -a "${GITHUB_WORKSPACE}/." 会把工作区"全部内容"(包括
       #   解压出来的 sdk/、sdk-archive/、sha256sums)复制进插件包目录, cp 检测到
       #   源目录是目标的祖先, 直接报错:
       #     cp: cannot copy a directory, 'sdk', into itself,
       #         'sdk/package/luci-app-dockerman/sdk'
-      #   退出码 1, 流程中断。检出隔离到 plugin/ 后此问题根除。
-      # 若 workflow 不在插件仓库内, 删除本步, 改用:
-      #   git clone --depth 1 -b ${PLUGIN_BRANCH} \
-      #     https://github.com/${PLUGIN_REPO}.git plugin
       # -------------------------------------------------------------------------
-      - name: Checkout plugin source
-        uses: actions/checkout@v4
-        with:
-          path: plugin   # 检出到 ./plugin, 与 sdk/ 等构建目录隔离
+      - name: Clone plugin source
+        run: |
+          # 【V5.3 修正】插件源码改为从 PLUGIN_REPO 主动克隆, 不再依赖 checkout:
+          #   你的仓库可能只放 workflow 文件(没有插件源码) —— 此时 checkout 拿到
+          #   的目录里没有任何插件, 之前"编译成功"其实是 feeds 里收录的
+          #   luci-app-dockerman 在被编译, 与 lisaac 原始仓库无关。
+          #   主动克隆后, 本地 package/ 版本将优先于 feed 同名包参与编译。
+          # 【不可变】--depth 1 只拉最新一次提交; -b 指定分支。
+          rm -rf plugin
+          git clone --depth 1 -b "${PLUGIN_BRANCH}" \
+            "https://github.com/${PLUGIN_REPO}.git" plugin
+          echo ">> 已克隆 ${PLUGIN_REPO} (${PLUGIN_BRANCH})"
+          find plugin -maxdepth 2 -name Makefile
 
       - name: Install build dependencies
         run: |
@@ -252,9 +261,19 @@ jobs:
       # -------------------------------------------------------------------------
       - name: Copy plugin & extra deps into SDK
         run: |
-          SRC="plugin"
-          [ -n "${PLUGIN_SUBDIR}" ] && SRC="plugin/${PLUGIN_SUBDIR}"
-          [ -f "${SRC}/Makefile" ] || { echo "!! ${SRC} 下没有 Makefile，检查 PLUGIN_SUBDIR 设置"; exit 1; }
+          # 【V5.2】定位插件目录: auto=自动探测, 否则用指定路径
+          if [ -n "${PLUGIN_SUBDIR}" ] && [ "${PLUGIN_SUBDIR}" != "auto" ]; then
+            SRC="plugin/${PLUGIN_SUBDIR}"
+            [ -f "${SRC}/Makefile" ] || { echo "!! ${SRC}/Makefile 不存在，检查 PLUGIN_SUBDIR 设置"; exit 1; }
+          else
+            # 自动探测: 找 plugin/ 里最浅层的 Makefile (ASCII 排序使根目录优先)
+            echo "== plugin/ 内容预览 =="
+            find plugin -maxdepth 2 | head -30
+            MK=$(find plugin -maxdepth 3 -name Makefile 2>/dev/null | sort | head -n1)
+            [ -n "${MK}" ] || { echo "!! 整个 plugin/ 里找不到 Makefile —— 克隆失败或仓库里没有插件本体?"; exit 1; }
+            SRC="${MK%/*}"
+            echo ">> 自动定位插件目录: ${SRC}"
+          fi
           mkdir -p "sdk/package/${PLUGIN_NAME}"
           cp -a "${SRC}/." "sdk/package/${PLUGIN_NAME}/"
           for pkg in ${EXTRA_PKGS}; do
