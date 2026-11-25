@@ -103,6 +103,10 @@ jobs:
       PLUGIN_NAME: luci-app-dockerman
       PLUGIN_REPO: lisaac/luci-app-dockerman
       PLUGIN_BRANCH: master
+      # 【可变·V5.1 新增】插件 Makefile 在仓库内的相对路径(相对仓库根):
+      #   lisaac 仓库按 LuCI feed 布局放在 applications/ 下, 必须指明;
+      #   若插件 Makefile 直接在仓库根目录, 置空 ""
+      PLUGIN_SUBDIR: "applications/luci-app-dockerman"
       # 编译期还需要但不在任何 feed 里的依赖包(空格分隔, "owner/repo:branch" 格式)
       EXTRA_PKGS: "lisaac/luci-lib-docker:master"
       # feeds 里能解析到的依赖包名
@@ -239,11 +243,20 @@ jobs:
       # 【注意·V3 修复】只复制 plugin/ 子目录的内容(plugin/. 的"点"表示连
       #   隐藏文件一起拷)，绝不能复制整个工作区 —— 否则 sdk/ 自己也被塞进插件
       #   包目录，触发 "cannot copy a directory into itself"(退出码 1)。
+      # 【注意·V5.1 新增】PLUGIN_SUBDIR: 有些仓库(如 lisaac/luci-app-dockerman)
+      #   按 LuCI 官方 feed 布局组织, 插件本体不在仓库根目录而在
+      #   applications/luci-app-dockerman/ 子目录。必须只拷这个子目录,
+      #   保证 sdk/package/<名>/Makefile 直接可见 —— 整仓库拷贝会把 Makefile
+      #   埋到三层深处, 主包靠扫描深度侥幸能编, 但 i18n 子包注册路径不可控。
+      #   仓库根目录就是插件本体的, 置空 "" 即可。
       # -------------------------------------------------------------------------
       - name: Copy plugin & extra deps into SDK
         run: |
+          SRC="plugin"
+          [ -n "${PLUGIN_SUBDIR}" ] && SRC="plugin/${PLUGIN_SUBDIR}"
+          [ -f "${SRC}/Makefile" ] || { echo "!! ${SRC} 下没有 Makefile，检查 PLUGIN_SUBDIR 设置"; exit 1; }
           mkdir -p "sdk/package/${PLUGIN_NAME}"
-          cp -a plugin/. "sdk/package/${PLUGIN_NAME}/"
+          cp -a "${SRC}/." "sdk/package/${PLUGIN_NAME}/"
           for pkg in ${EXTRA_PKGS}; do
             repo="${pkg%%:*}"; branch="${pkg##*:}"
             name=$(basename "${repo}")
@@ -303,13 +316,12 @@ jobs:
       - name: Compile plugin (and dependencies)
         working-directory: sdk
         run: |
+          # 【V5.1 修正】语言包不需要(也不能)单独指定 make 目标:
+          #   luci-i18n-* 是 luci.mk 从同目录 po/ 派生的"虚拟子包", 没有独立目录,
+          #   `make package/luci-i18n-*/compile` 会报 "No rule to make target"
+          #   (退出码 2)。正确机制: 只要 .config 里 CONFIG_PACKAGE_luci-i18n-*
+          #   =y, 上面这一条主包 compile 就会连带产出语言包。
           make -j"$(nproc)" package/${PLUGIN_NAME}/compile V=s
-          # 【V5 新增·注意】语言包是和主包平级的独立包, 不会被主包的 compile
-          # 连带编译, 必须单独指定 make 目标, 否则 .config 里选了也不会产出。
-          APP_BASE="${PLUGIN_NAME#luci-app-}"
-          for lang in ${I18N_LANGS}; do
-            make -j"$(nproc)" package/luci-i18n-${APP_BASE}-${lang}/compile V=s
-          done
 
       # -------------------------------------------------------------------------
       # ⑧ 收集产物 (V4: 默认只收"插件 + 显式依赖", 不再无脑收全部)
@@ -361,6 +373,10 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           [ -n "$(ls out 2>/dev/null)" ] || { echo "!! 没有编译产物"; exit 1; }
+          # 【V5.1 防线】选了语言包却没产出 → 立刻失败, 不让缺包静默溜过
+          if [ -n "${I18N_LANGS}" ]; then
+            ls out/luci-i18n-* >/dev/null 2>&1 || { echo "!! 选择了语言包但产物中无 luci-i18n-*，检查 po/ 目录与 .config"; exit 1; }
+          fi
 
       - name: Upload packages
         uses: actions/upload-artifact@v4
