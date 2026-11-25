@@ -284,6 +284,25 @@ jobs:
           done
 
       # -------------------------------------------------------------------------
+      # 【V5.4 新增·关键】apk 版本号兼容修正
+      # 【注意】25.12 起包管理器从 opkg 换成 apk, apk 严格要求版本号以数字开头:
+      #   opkg 时代 PKG_VERSION:=v0.3.4 能过, apk 直接拒收:
+      #     ERROR: info field 'version' has invalid value: package version is invalid
+      #   第三方仓库(lisaac 等)普遍写 v 前缀版本, feed 里的包已被官方修过,
+      #   只有编原始源码才会踩到 —— 修正方法: 去掉版本号前面的 v。
+      # -------------------------------------------------------------------------
+      - name: Sanitize package versions for apk
+        run: |
+          echo "== apk 版本号兼容检查 =="
+          find sdk/package -maxdepth 5 -name Makefile | while read -r f; do
+            if grep -qE '^PKG_VERSION[:]?=[[:space:]]*v[0-9]' "$f"; then
+              sed -i -E 's/^(PKG_VERSION[:]?=[[:space:]]*)v([0-9])/\1\2/' "$f"
+              echo "  已修正 v 前缀: $f"
+            fi
+          done
+          echo "== 检查完成 =="
+
+      # -------------------------------------------------------------------------
       # ⚠3 刷新 feeds —— 命令与 OpenWrt 一模一样，但行为不同:
       #   ImmortalWrt SDK 内的 feeds.conf.default 指向它自己的 fork 仓库
       #   (immortalwrt/packages 等)，里面多出大量国内常用插件与补丁版本，
