@@ -1,7 +1,12 @@
 # =============================================================================
-# 文件名: immortalwrt-sdk-build.yml  (V4 修正版)
+# 文件名: immortalwrt-sdk-build.yml  (V5 修正版)
 # 用途  : 基于【ImmortalWrt 官方 SDK】在 GitHub Actions 上编译单个 LuCI 插件
 #         示例插件: luci-app-dockerman (Docker 管理界面)
+#
+# V5 修正内容（相对 V4）:
+#   ✔ 新增中文语言包: LuCI 的 i18n 是独立子包 (luci-i18n-dockerman-zh-cn),
+#     之前只编译主包, 装上后界面是英文。现在通过 I18N_LANGS 变量选中并
+#     单独编译、收集语言包 (机制见 Configure/Compile/Collect 三处注释)
 #
 # V4 修正内容（相对 V3）:
 #   ✔ 产物过多: 关闭 SDK 默认"全选"开关(CONFIG_ALL / CONFIG_ALL_KMODS /
@@ -58,12 +63,26 @@ on:
         description: "子平台"
         required: true
         default: "64"
-      # 【可变】是否创建 GitHub Release(仓库 Releases 页的正式发布)
-      # 【注意】false 时只上传 artifact(在 Actions run 页面, 默认保留 90 天)
-      publish_release:
-        description: "是否创建 GitHub Release(true/false)"
+      # 【可变·V5 下拉框】是否编译中文语言包 —— type: choice 会渲染成下拉框,
+      # 不需要手动输入; 值是中文"是/否", 后续用表达式换算成 I18N_LANGS
+      build_i18n:
+        description: "是否编译中文语言包 (下拉选择)"
         required: true
-        default: "false"
+        default: "是"
+        type: choice
+        options:
+          - "是"
+          - "否"
+      # 【可变】是否创建 GitHub Release(仓库 Releases 页的正式发布)
+      # 【注意】选"否"时只上传 artifact(在 Actions run 页面, 默认保留 90 天)
+      publish_release:
+        description: "是否创建 GitHub Release (下拉选择)"
+        required: true
+        default: "否"
+        type: choice
+        options:
+          - "是"
+          - "否"
 
 # 【不可变·V4 新增】Release 需要写权限; 只上传 artifact 时可改为 contents: read
 permissions:
@@ -88,6 +107,13 @@ jobs:
       EXTRA_PKGS: "lisaac/luci-lib-docker:master"
       # feeds 里能解析到的依赖包名
       FEED_DEPS: "luci-lib-jsonc"
+      # 【可变·V5 新增】语言包列表(空格分隔)。LuCI 的界面翻译是独立子包:
+      #   luci-app-dockerman 的中文包名固定为 luci-i18n-dockerman-zh-cn,
+      #   由 luci.mk 从插件源码的 po/zh_Hans 目录自动生成, 不需要额外下载。
+      #   不要中文界面可置空 "", 要多语言可写 "zh-cn en"
+      # 【V5 下拉框】I18N_LANGS 由表单下拉框 build_i18n(是/否) 动态换算:
+      #   选"是" → zh-cn; 选"否" → 空串(后续三个循环自然全部跳过)
+      I18N_LANGS: ${{ inputs.build_i18n == '是' && 'zh-cn' || '' }}
       # 【可变·V4 新增】产物收集范围:
       #   false = 只收插件本身 + EXTRA_PKGS + FEED_DEPS 对应的包(推荐, 体积小)
       #   true  = 收 bin/packages 下全部产物(依赖链上的所有包, 可能上百个)
@@ -262,6 +288,13 @@ jobs:
           echo "CONFIG_ALL_NONSHARED=n"   >> .config
           echo "CONFIG_PACKAGE_${PLUGIN_NAME}=y" >> .config
           for d in ${FEED_DEPS}; do echo "CONFIG_PACKAGE_${d}=y" >> .config; done
+          # 【V5 新增】选中语言包子包。命名规则【不可变】:
+          #   luci-i18n-<插件名去掉luci-app-前缀>-<语言代码>, 如 luci-i18n-dockerman-zh-cn。
+          #   语言代码与源码 po/ 目录名对应: po/zh_Hans → zh-cn (LuCI 做了映射)
+          APP_BASE="${PLUGIN_NAME#luci-app-}"
+          for lang in ${I18N_LANGS}; do
+            echo "CONFIG_PACKAGE_luci-i18n-${APP_BASE}-${lang}=y" >> .config
+          done
           make defconfig
           # 确认: 目标包被选中, 且"全选"开关确实是 n
           grep -E "CONFIG_PACKAGE_${PLUGIN_NAME}=y" .config
@@ -271,6 +304,12 @@ jobs:
         working-directory: sdk
         run: |
           make -j"$(nproc)" package/${PLUGIN_NAME}/compile V=s
+          # 【V5 新增·注意】语言包是和主包平级的独立包, 不会被主包的 compile
+          # 连带编译, 必须单独指定 make 目标, 否则 .config 里选了也不会产出。
+          APP_BASE="${PLUGIN_NAME#luci-app-}"
+          for lang in ${I18N_LANGS}; do
+            make -j"$(nproc)" package/luci-i18n-${APP_BASE}-${lang}/compile V=s
+          done
 
       # -------------------------------------------------------------------------
       # ⑧ 收集产物 (V4: 默认只收"插件 + 显式依赖", 不再无脑收全部)
@@ -287,6 +326,11 @@ jobs:
           names="${PLUGIN_NAME}"
           for p in ${EXTRA_PKGS}; do names="${names} $(basename "${p%%:*}")"; done
           names="${names} ${FEED_DEPS}"
+          # 【V5 新增】语言包子包加入收集名单, 否则编出来了也被过滤掉
+          APP_BASE="${PLUGIN_NAME#luci-app-}"
+          for lang in ${I18N_LANGS}; do
+            names="${names} luci-i18n-${APP_BASE}-${lang}"
+          done
           echo "本次目标包: ${names}"
 
           if [ "${COLLECT_ALL}" = "true" ]; then
@@ -335,7 +379,7 @@ jobs:
       # 【可变】tag 命名规则、是否 draft/prerelease 自行决定。
       # -------------------------------------------------------------------------
       - name: Publish release
-        if: ${{ inputs.publish_release == 'true' }}
+        if: ${{ inputs.publish_release == '是' }}   # 【V5 下拉框】表单选"是"才发布
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.PLUGIN_NAME }}-${{ inputs.immortalwrt_version }}-${{ inputs.target }}-${{ inputs.subtarget }}
