@@ -167,7 +167,7 @@ jobs:
       # 【可变】key 含版本/平台，版本变更自动失效
       # -------------------------------------------------------------------------
       - name: Restore SDK cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: sdk-archive
           key: immortalwrt-sdk-${{ inputs.immortalwrt_version }}-${{ inputs.target }}-${{ inputs.subtarget }}
@@ -417,7 +417,7 @@ jobs:
           fi
 
       - name: Upload packages
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: immortalwrt-${{ inputs.immortalwrt_version }}-${{ inputs.target }}-${{ inputs.subtarget }}-${{ env.PLUGIN_NAME }}
           path: out/*
@@ -432,17 +432,35 @@ jobs:
       # 【不可变】tag_name 必须全局唯一; 重复用同一 tag 会报 "already_exists"。
       # 【可变】tag 命名规则、是否 draft/prerelease 自行决定。
       # -------------------------------------------------------------------------
+      # -------------------------------------------------------------------------
+      # 【V5.5 新增】生成带时间戳的 Release 标签 (UTC 时间)
+      # 【注意】GitHub 的 Release 以 tag 为唯一标识: 同一个 tag 再次发布会
+      #   覆盖旧 Release 并替换同名资产。加上时间戳后每次构建标签都不同,
+      #   历史发布记录全部保留, 互不覆盖。
+      # 【不可变】date -u 用 UTC, 避免 runner 时区(UTC)与本地时区不一致造成误解。
+      # -------------------------------------------------------------------------
+      - name: Prepare release metadata
+        if: ${{ inputs.publish_release == '是' }}
+        run: |
+          TS=$(date -u +%Y%m%d-%H%M%S)
+          TAG="${PLUGIN_NAME}-${{ inputs.immortalwrt_version }}-${{ inputs.target }}-${{ inputs.subtarget }}-${TS}"
+          echo "RELEASE_TAG=${TAG}"   >> "$GITHUB_ENV"
+          echo "RELEASE_TIME=${TS}"   >> "$GITHUB_ENV"
+          echo ">> Release 标签: ${TAG}"
+
       - name: Publish release
         if: ${{ inputs.publish_release == '是' }}   # 【V5 下拉框】表单选"是"才发布
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ env.PLUGIN_NAME }}-${{ inputs.immortalwrt_version }}-${{ inputs.target }}-${{ inputs.subtarget }}
-          name: ${{ env.PLUGIN_NAME }} for ImmortalWrt ${{ inputs.immortalwrt_version }} (${{ inputs.target }}/${{ inputs.subtarget }})
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: ${{ env.PLUGIN_NAME }} for ImmortalWrt ${{ inputs.immortalwrt_version }} (${{ inputs.target }}/${{ inputs.subtarget }}) · ${{ env.RELEASE_TIME }} UTC
           body: |
             自动构建产物
             - 发行版: ImmortalWrt ${{ inputs.immortalwrt_version }}
             - 平台: ${{ inputs.target }}/${{ inputs.subtarget }}
             - 插件: ${{ env.PLUGIN_NAME }}
+            - 构建时间: ${{ env.RELEASE_TIME }} (UTC)
+            - 触发提交: ${{ github.sha }}
             - 产物格式: ImmortalWrt 25.12+ 为 .apk；24.10 及更早为 .ipk
           files: out/*
           fail_on_unmatched_files: true
